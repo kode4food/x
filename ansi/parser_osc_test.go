@@ -59,10 +59,12 @@ func TestOscSequence(t *testing.T) {
 			},
 		},
 		{
+			// 末 (U+672B) is E6 9C AB; 0x9C is also the 8-bit ST control
+			// code, and must not truncate the character mid-sequence.
 			name:  "string_terminator",
 			input: "\x1b]2;\xe6\x9c\xab\x1b\\",
 			expected: []any{
-				[]byte("2;\xe6"),
+				[]byte("2;\xe6\x9c\xab"),
 				Cmd('\\'),
 			},
 		},
@@ -101,5 +103,29 @@ func TestOscSequence(t *testing.T) {
 			assertEqual(t, len(c.expected), len(dispatcher.dispatched))
 			assertEqual(t, c.expected, dispatcher.dispatched)
 		})
+	}
+}
+
+// TestOscUtf8SplitAcrossAdvance covers a title glyph such as ✳ (U+2733,
+// encoded E2 9C B3) arriving across separate Advance calls, as real PTY
+// reads do, since a byte split mid-rune previously bypassed the parser's
+// UTF-8 tracking and let 0x9C terminate the string early.
+func TestOscUtf8SplitAcrossAdvance(t *testing.T) {
+	const maxBufferSize = 1024
+	full := "\x1b]0;\xe2\x9c\xb3 Pick a choice\x07"
+	want := []byte("0;\xe2\x9c\xb3 Pick a choice")
+
+	for split := 1; split < len(full)-1; split++ {
+		dispatcher := &testDispatcher{}
+		parser := testParser(dispatcher)
+		parser.data = make([]byte, maxBufferSize)
+		parser.dataLen = maxBufferSize
+		for _, b := range []byte(full[:split]) {
+			parser.Advance(b)
+		}
+		for _, b := range []byte(full[split:]) {
+			parser.Advance(b)
+		}
+		assertEqual(t, []any{want}, dispatcher.dispatched)
 	}
 }

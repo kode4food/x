@@ -50,6 +50,13 @@ type Parser struct {
 
 	// state is the current state of the parser.
 	state byte
+
+	// stringUtf8Remain is the number of continuation bytes still expected
+	// to complete a multi-byte rune while inside an OSC, DCS, SOS, PM, or
+	// APC string. It keeps a C1 byte (0x80-0x9F) that lands mid-rune, such
+	// as the second byte of "✳" (E2 9C B3), from being misread as that C1
+	// code's control meaning: see [Parser.Advance].
+	stringUtf8Remain int
 }
 
 // NewParser returns a new parser with the default settings.
@@ -126,6 +133,7 @@ func (p *Parser) Data() []byte {
 func (p *Parser) Reset() {
 	p.clear()
 	p.state = parser.GroundState
+	p.stringUtf8Remain = 0
 }
 
 // clear clears the parser parameters and command.
@@ -162,9 +170,40 @@ func (p *Parser) Advance(b byte) parser.Action {
 	case parser.Utf8State:
 		// We handle UTF-8 here.
 		return p.advanceUtf8(b)
+	case parser.OscStringState, parser.DcsStringState, parser.SosStringState,
+		parser.PmStringState, parser.ApcStringState:
+		if p.stringUtf8Remain > 0 {
+			return p.advanceStringUtf8(b)
+		}
+		if utf8ByteLen(b) > 1 {
+			return p.startStringUtf8(b)
+		}
+		return p.advance(b)
 	default:
 		return p.advance(b)
 	}
+}
+
+// startStringUtf8 begins tracking a multi-byte rune inside a string state,
+// storing its lead byte as ordinary string data.
+func (p *Parser) startStringUtf8(b byte) parser.Action {
+	p.stringUtf8Remain = utf8ByteLen(b) - 1
+	p.performAction(parser.PutAction, p.state, b)
+	return parser.PutAction
+}
+
+// advanceStringUtf8 consumes one expected continuation byte of a rune
+// being tracked inside a string state. A byte outside the continuation
+// range (0x80-0xBF) means the sequence was malformed, so tracking is
+// abandoned and b is reprocessed as ordinary string-state input instead.
+func (p *Parser) advanceStringUtf8(b byte) parser.Action {
+	if b < 0x80 || b > 0xBF {
+		p.stringUtf8Remain = 0
+		return p.advance(b)
+	}
+	p.stringUtf8Remain--
+	p.performAction(parser.PutAction, p.state, b)
+	return parser.PutAction
 }
 
 func (p *Parser) collectRune(b byte) {
@@ -323,6 +362,7 @@ func (p *Parser) performAction(action parser.Action, state parser.State, b byte)
 		}
 
 	case parser.StartAction:
+		p.stringUtf8Remain = 0
 		if p.dataLen < 0 && p.data != nil {
 			p.data = p.data[:0]
 		} else {
