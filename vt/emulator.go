@@ -41,15 +41,14 @@ type Emulator struct {
 
 	// The last written character.
 	lastChar rune // either ansi.Rune or ansi.Grapheme
-	// A slice of runes to compose a grapheme.
-	grapheme []rune
+	// The bytes of a grapheme cluster still being composed. Bytes rather than
+	// runes, so the segmenter can read the buffer without a conversion on
+	// every character.
+	grapheme []byte
 
 	// The ANSI parser to use.
 	parser *ansi.Parser
-	// The last parser state.
-	lastState parser.State
-
-	cb Callbacks
+	cb     Callbacks
 
 	// The terminal's icon name and title.
 	iconName, title string
@@ -168,14 +167,16 @@ func (e *Emulator) WidthMethod() uv.WidthMethod {
 }
 
 // Draw implements the [uv.Drawable] interface.
+//
+// It paints the entire visible screen, not just the lines that changed
+// since the last write: most hosts (including Bubble Tea) rebuild the frame
+// every render pass and diff it themselves, so an incremental paint here
+// would make content vanish between writes.
 func (e *Emulator) Draw(scr uv.Screen, area uv.Rectangle) {
 	bg := uv.EmptyCell
 	bg.Style.Bg = e.BackgroundColor()
 	screen.FillArea(scr, &bg, area)
-	for y := range e.Touched() {
-		if y < 0 || y >= e.Height() {
-			continue
-		}
+	for y := 0; y < e.Height(); y++ {
 		for x := 0; x < e.Width(); {
 			w := 1
 			cell := e.CellAt(x, y)
@@ -211,6 +212,18 @@ func (e *Emulator) Width() int {
 func (e *Emulator) CursorPosition() uv.Position {
 	x, y := e.scr.CursorPosition()
 	return uv.Pos(x, y)
+}
+
+// CursorHidden reports whether the cursor is currently hidden. Full-screen
+// TUIs hide the cursor constantly, and a host that renders the cursor on
+// top of this emulator must respect that or it will show a phantom cursor.
+func (e *Emulator) CursorHidden() bool {
+	return e.scr.cur.Hidden
+}
+
+// CursorStyle returns the current cursor style and whether it is blinking.
+func (e *Emulator) CursorStyle() (style CursorStyle, blink bool) {
+	return e.scr.cur.Style, !e.scr.cur.Steady
 }
 
 // Resize resizes the terminal.
@@ -274,15 +287,13 @@ func (e *Emulator) Write(p []byte) (n int, err error) {
 
 	for i := range p {
 		e.parser.Advance(p[i])
-		state := e.parser.State()
-		// flush grapheme if we transitioned to a non-utf8 state or we have
-		// written the whole byte slice.
-		if len(e.grapheme) > 0 {
-			if (e.lastState == parser.GroundState && state != parser.Utf8State) || i == len(p)-1 {
-				e.flushGrapheme()
-			}
+		// Flush the last cluster once the whole slice is written. Every
+		// sequence handler flushes on its own way in, so a cluster only has to
+		// survive until either the next printable character extends it or the
+		// write ends.
+		if len(e.grapheme) > 0 && i == len(p)-1 {
+			e.flushGrapheme()
 		}
-		e.lastState = state
 	}
 	return len(p), nil
 }
@@ -418,7 +429,7 @@ func (e *Emulator) IndexedColor(i int) color.Color {
 	c := e.colors[i]
 	if c == nil {
 		// Return the default color.
-		return ansi.IndexedColor(i) //nolint:gosec
+		return ansi.IndexedColor(i)
 	}
 
 	return c
